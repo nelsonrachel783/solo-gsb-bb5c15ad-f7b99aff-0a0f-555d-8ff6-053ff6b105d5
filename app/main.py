@@ -1,7 +1,7 @@
 """FastAPI 入口：POST /segments 字幕分段、POST /ad-breaks 广告插播点、
 POST /speaker-reconcile 说话人校正、POST /chapter-align 章节时刻对齐、
 POST /duplicate-passages 重复口播片段检测、POST /redact-preview 敏感短语
-遮罩预览服务。"""
+遮罩预览、POST /trailer-plan 预告片片段组合服务。"""
 
 from fastapi import FastAPI, Request
 from fastapi.exceptions import RequestValidationError
@@ -25,10 +25,13 @@ from .schemas import (
     SegmentResponse,
     SpeakerReconcileRequest,
     SpeakerReconcileResponse,
+    TrailerPlanRequest,
+    TrailerPlanResponse,
 )
 from .segmentation import optimal_segmentation
 from .speaker_reconcile import reconcile_speakers
 from .srt import render_srt
+from .trailer_plan import plan_trailer
 
 app = FastAPI(
     title="Podcast Subtitle Segmentation API",
@@ -36,8 +39,9 @@ app = FastAPI(
     "在词间静音处选择最优广告插播点，在人工锁定约束下校正说话人标注，"
     "按章节 cue 文本命中把章节对齐到词时间轴，"
     "检测词序列完全相同的重复口播片段，"
-    "并对命中敏感短语的字符生成逐字遮罩预览。",
-    version="1.5.0",
+    "对命中敏感短语的字符生成逐字遮罩预览，"
+    "并在词区间不重叠与时长预算约束下组合必选说话人全覆盖的预告片片段。",
+    version="1.6.0",
 )
 
 
@@ -65,7 +69,9 @@ async def validation_exception_handler(_: Request, exc: RequestValidationError):
         "approx_ms）与正整数 min_gap_ms；/duplicate-passages 另需 "
         "min_words∈[2,20]、非负整数 min_gap_ms，且 words 至多 2000 个；"
         "/redact-preview 另需 phrases 为 1～50 个非空字符串，"
-        "且 words 至多 2000 个",
+        "且 words 至多 2000 个；/trailer-plan 另需 1～20 个 candidates"
+        "（每项含整数 start_word/end_word 与非负整数 score）、非负整数 "
+        "budget_ms 与 1～3 个非空 required_speakers",
         {"errors": exc.errors()},
     )
 
@@ -138,3 +144,18 @@ async def create_duplicate_passages(request: DuplicatePassagesRequest):
 async def create_redact_preview(request: RedactPreviewRequest):
     words, hits = redact_preview(request.words, request.phrases)
     return RedactPreviewResponse(words=words, hits=hits)
+
+
+@app.post("/trailer-plan", response_model=TrailerPlanResponse)
+async def create_trailer_plan(request: TrailerPlanRequest):
+    clips, total_score, total_duration_ms = plan_trailer(
+        request.words,
+        request.candidates,
+        request.budget_ms,
+        request.required_speakers,
+    )
+    return TrailerPlanResponse(
+        clips=clips,
+        total_score=total_score,
+        total_duration_ms=total_duration_ms,
+    )

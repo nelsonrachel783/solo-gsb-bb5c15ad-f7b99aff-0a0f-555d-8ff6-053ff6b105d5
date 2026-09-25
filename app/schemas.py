@@ -179,3 +179,50 @@ class RedactPreviewResponse(BaseModel):
     hits: list[RedactHitOut] = Field(
         ..., description="按命中位置升序的命中列表；无命中时为空数组"
     )
+
+
+class TrailerCandidateIn(BaseModel):
+    start_word: int = Field(..., description="候选片段首词序号（0-based，含）")
+    end_word: int = Field(..., description="候选片段末词序号（0-based，含）")
+    score: int = Field(..., ge=0, description="候选片段评分（非负整数）")
+
+
+class TrailerPlanRequest(BaseModel):
+    words: list[WordIn] = Field(..., min_length=1, description="按时间排列的词序列")
+    candidates: list[TrailerCandidateIn] = Field(
+        ...,
+        min_length=1,
+        max_length=20,
+        description="候选片段：1～20 个，每个须为单一说话人的连续词区间",
+    )
+    budget_ms: int = Field(
+        ..., ge=0, description="预告片总时长上限（毫秒，非负整数）"
+    )
+    required_speakers: list[Annotated[str, Field(min_length=1)]] = Field(
+        ...,
+        min_length=1,
+        max_length=3,
+        description="必选说话人：1～3 个非空标识，每个至少在选中片段中出现一次",
+    )
+
+
+class TrailerClipOut(BaseModel):
+    index: int
+    candidate_index: int = Field(..., description="原候选序号（0-based）")
+    speaker: str
+    score: int
+    start_word: int = Field(..., description="片段首词序号（0-based，含）")
+    end_word: int = Field(..., description="片段末词序号（0-based，含）")
+    source_start_ms: int = Field(..., description="片段源起点：首词 start_ms")
+    source_end_ms: int = Field(..., description="片段源终点：末词 end_ms")
+    duration_ms: int = Field(..., description="片段时长：source_end_ms - source_start_ms")
+    trailer_start_ms: int = Field(..., description="预告片内起点：从 0 起按片段时长累加")
+    trailer_end_ms: int = Field(..., description="预告片内终点：trailer_start_ms + duration_ms")
+
+
+class TrailerPlanResponse(BaseModel):
+    clips: list[TrailerClipOut] = Field(..., description="按源时间升序的选中片段")
+    total_score: int = Field(..., description="选中片段的总评分（最大化）")
+    total_duration_ms: int = Field(
+        ..., description="选中片段的总时长（同分时最小化；不超过 budget_ms）"
+    )

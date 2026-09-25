@@ -5,8 +5,10 @@
 总静音最长、满足间隔约束的插播位置，**说话人校正**接口，在人工锁定约束下
 以最小代价重指派说话人，**章节时刻对齐**接口，按章节 cue 文本在同一说话人
 连续词中的命中把章节锚定到词时间轴，**重复口播片段**接口，检测词序列
-完全相同的两处口播片段，以及**敏感短语遮罩预览**接口，把命中敏感短语的字符
-逐字替换为 `█` 并回报每处命中位置。基于 Python 3.12 + FastAPI。
+完全相同的两处口播片段，**敏感短语遮罩预览**接口，把命中敏感短语的字符
+逐字替换为 `█` 并回报每处命中位置，以及**预告片片段组合**接口，在词区间
+互不重叠与时长预算约束下选出必选说话人全覆盖、总评分最高的候选片段组合。
+基于 Python 3.12 + FastAPI。
 
 ## 一条命令启动
 
@@ -23,6 +25,7 @@ docker compose up --build
 - 章节时刻对齐接口：`POST http://localhost:8000/chapter-align`
 - 重复口播片段接口：`POST http://localhost:8000/duplicate-passages`
 - 敏感短语遮罩预览接口：`POST http://localhost:8000/redact-preview`
+- 预告片片段组合接口：`POST http://localhost:8000/trailer-plan`
 - 健康检查：`GET http://localhost:8000/health`
 - 交互式 API 文档（Swagger UI）：`http://localhost:8000/docs`
 
@@ -552,13 +555,127 @@ curl -s http://localhost:8000/redact-preview \
 }
 ```
 
+## 预告片片段组合：`POST /trailer-plan`
+
+从 1～20 个候选片段中选出**词区间互不重叠、总时长不超 `budget_ms`** 的组合，
+使 1～3 个**必选说话人**各自至少在某个选中片段中出现一次。候选片段必须是
+**单一说话人的连续词区间**，时长取末词 `end_ms` 减首词 `start_ms`。
+`words` 字段与 `/segments` 相同，并沿用同一套词序与时间校验（422 错误码一致）。
+
+服务地址：`POST http://localhost:8000/trailer-plan`
+
+```json
+{
+  "words": [
+    {"start_ms": 0,    "end_ms": 800,  "text": "开场白",   "speaker": "A"},
+    {"start_ms": 800,  "end_ms": 1600, "text": "欢迎收听", "speaker": "A"},
+    {"start_ms": 1600, "end_ms": 2400, "text": "今天聊聊", "speaker": "B"},
+    {"start_ms": 2400, "end_ms": 3200, "text": "动态规划", "speaker": "B"},
+    {"start_ms": 3200, "end_ms": 4000, "text": "下期再见", "speaker": "A"}
+  ],
+  "candidates": [
+    {"start_word": 0, "end_word": 1, "score": 5},
+    {"start_word": 2, "end_word": 3, "score": 7},
+    {"start_word": 4, "end_word": 4, "score": 3}
+  ],
+  "budget_ms": 2400,
+  "required_speakers": ["A", "B"]
+}
+```
+
+字段说明（`words` 之外）：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `candidates` | 数组，1～20 个 | 候选片段；每项含 `start_word`/`end_word`（0-based、含端点的词序号）与非负整数 `score` |
+| `budget_ms` | 非负整数 | 选中片段的总时长上限（毫秒） |
+| `required_speakers` | 非空字符串数组，1～3 个 | 必选说话人，每个至少在选中片段中出现一次；重复项按去重处理 |
+
+### 组合规则
+
+1. **候选合法性**：候选词序号须在词序列范围内、`start_word <= end_word`，且区间内
+   所有词的 `speaker` 相同（否则返回 422，详见错误表）；候选时长为
+   `words[end_word].end_ms - words[start_word].start_ms`；
+2. **约束**：选中片段的词区间互不重叠（端点相接允许）；总时长 `<= budget_ms`；
+   每个必选说话人至少在某个选中片段中出现一次（非必选说话人的片段可自由加入）；
+3. **目标**：先**最大化总评分**，同分**最小化总时长**，再按**原时间顺序排列的
+   候选序号序列**字典序取最小者（序号即 `candidates` 数组中的 0-based 下标）；
+4. 不存在满足全部约束的组合时返回 **422**（`infeasible_trailer_plan`）。
+
+### 响应示例（200）
+
+```json
+{
+  "clips": [
+    {
+      "index": 0,
+      "candidate_index": 1,
+      "speaker": "B",
+      "score": 7,
+      "start_word": 2,
+      "end_word": 3,
+      "source_start_ms": 1600,
+      "source_end_ms": 3200,
+      "duration_ms": 1600,
+      "trailer_start_ms": 0,
+      "trailer_end_ms": 1600
+    },
+    {
+      "index": 1,
+      "candidate_index": 2,
+      "speaker": "A",
+      "score": 3,
+      "start_word": 4,
+      "end_word": 4,
+      "source_start_ms": 3200,
+      "source_end_ms": 4000,
+      "duration_ms": 800,
+      "trailer_start_ms": 1600,
+      "trailer_end_ms": 2400
+    }
+  ],
+  "total_score": 10,
+  "total_duration_ms": 2400
+}
+```
+
+> `clips` 按源时间升序返回，`index` 为 0-based 序号，`candidate_index` 为原候选
+> 序号。`source_start_ms`/`source_end_ms` 为片段在原始时间轴上的源时刻（首词
+> `start_ms`、末词 `end_ms`）；`trailer_start_ms`/`trailer_end_ms` 为预告片内
+> 时刻——从 0 起按片段时长依次累加（上例第一段 0～1600ms、第二段 1600～2400ms）。
+> 上例中候选 0（A，1600ms/5 分）与候选 1（B，1600ms/7 分）组合需 3200ms 超预算，
+> 覆盖 A、B 的最优组合为候选 1 + 候选 2（10 分、2400ms）。
+
+### curl 示例
+
+```bash
+curl -s http://localhost:8000/trailer-plan \
+  -H 'Content-Type: application/json' \
+  -d '{"words":[{"start_ms":0,"end_ms":800,"text":"开场白","speaker":"A"},{"start_ms":800,"end_ms":1600,"text":"欢迎收听","speaker":"A"},{"start_ms":1600,"end_ms":2400,"text":"今天聊聊","speaker":"B"},{"start_ms":2400,"end_ms":3200,"text":"动态规划","speaker":"B"},{"start_ms":3200,"end_ms":4000,"text":"下期再见","speaker":"A"}],"candidates":[{"start_word":0,"end_word":1,"score":5},{"start_word":2,"end_word":3,"score":7},{"start_word":4,"end_word":4,"score":3}],"budget_ms":2400,"required_speakers":["A","B"]}'
+```
+
+### 无可行组合
+
+必选说话人在任何候选中都不出现，或满足覆盖与预算约束的组合不存在时，返回 422：
+
+```json
+{
+  "error": {
+    "code": "infeasible_trailer_plan",
+    "message": "不存在满足全部约束的预告片片段组合",
+    "candidate_count": 3,
+    "budget_ms": 2399
+  }
+}
+```
+
 ## 错误响应（HTTP 422）
 
 统一形如：`{"error": {"code": "...", "message": "...", ...}}`
 
 | `code` | 触发条件 | 附加字段 |
 | --- | --- | --- |
-| `invalid_request` | 请求体结构/字段类型不合法（含空 `words`、`switch_cost` 越界、`min_gap_ms` 越界、空 `chapters`/`title`/`cue`、`min_words` 越界、`words` 超过 2000 个、`phrases` 为空/超过 50 个/含空字符串） | `errors` |
+| `invalid_request` | 请求体结构/字段类型不合法（含空 `words`、`switch_cost` 越界、`min_gap_ms` 越界、空 `chapters`/`title`/`cue`、`min_words` 越界、`words` 超过 2000 个、`phrases` 为空/超过 50 个/含空字符串、`candidates` 为空/超过 20 个/含负 `score`、`budget_ms` 为负、`required_speakers` 为空/超过 3 个/含空字符串） | `errors` |
 | `invalid_time_range` | 某个词 `end_ms < start_ms` | `word_index` |
 | `time_out_of_order` | 相邻词 `start_ms` 倒序 | `word_index` |
 | `overlapping_time_range` | 某词 `start_ms` 早于前词 `end_ms`（重叠） | `word_index` |
@@ -568,6 +685,10 @@ curl -s http://localhost:8000/redact-preview \
 | `duplicate_lock` | 同一词序号被重复锁定 | `word_index` |
 | `too_many_speakers` | 候选说话人（原标注 ∪ 锁定值）超过 8 个 | `speaker_count` |
 | `infeasible_chapter_alignment` | 某章 cue 无命中，或无法组成满足间隔约束的完整章节方案 | 无命中时为 `chapter_index`；否则为 `chapter_count`、`min_gap_ms` |
+| `candidate_index_out_of_range` | 预告片候选词序号越界（含负数） | `candidate_index` |
+| `candidate_range_inverted` | 预告片候选 `start_word > end_word` | `candidate_index` |
+| `candidate_speaker_mixed` | 预告片候选词区间横跨多个说话人 | `candidate_index` |
+| `infeasible_trailer_plan` | 不存在满足全部约束的预告片片段组合 | `candidate_count`、`budget_ms` |
 
 ### 无可行分段
 
@@ -649,6 +770,16 @@ O(H) 空间**（H 为各章命中候选总数）。每章候选按全局字符�
 已选命中重叠；命中区间再经二分定位首末词，换算为首末词序号与两端词内字符偏移，
 最后仅把命中字符逐字替换为 `█`。
 
+预告片片段组合（`trailer_plan.py`）为排序分层 DP + 帕累托前沿 + 贪心重建，
+**O(m·2^k·F) 时间/空间**（m 为候选数 ≤ 20、k 为必选说话人数 ≤ 3、F 为单状态
+帕累托前沿长度）。候选按 `(start_word, end_word, 原序号)` 排序，二分预求每个
+候选之后第一个词区间不重叠的位置；状态 `(i, mask)` 记录从第 i 个候选起、尚待
+覆盖集合为 mask 时可达的 `(总评分, 总时长)` 帕累托前沿（同分只留最短时长，
+被支配点剪除），转移为“跳过”与“选上”两支的合并；答案取状态 `(0, 全集)`
+前沿中时长不超预算、评分最大（同分时长最短）的点；重建时从左向右枚举下一个
+被选候选，余项恰落在下一状态前沿内即可行，每步取原候选序号最小者，归纳可得
+时间顺序候选序号序列的字典序最小者。
+
 ## 测试
 
 核心算法只依赖 Python 标准库，无需安装任何第三方包即可运行：
@@ -676,6 +807,7 @@ app/
   chapter_align.py      # 章节时刻对齐（纯标准库，复用同一套输入校验）
   duplicate_passages.py # 重复口播片段检测（纯标准库，复用同一套输入校验）
   redact_preview.py     # 敏感短语遮罩预览（纯标准库，复用同一套输入校验）
+  trailer_plan.py       # 预告片片段组合（纯标准库，复用同一套输入校验）
   srt.py                # SRT 渲染
   errors.py             # DomainError
 tests/             # unittest：核心算法、暴力对拍、HTTP 接口层
@@ -685,6 +817,7 @@ tests/             # unittest：核心算法、暴力对拍、HTTP 接口层
   test_chapter_align.py
   test_duplicate_passages.py
   test_redact_preview.py
+  test_trailer_plan.py
   test_differential.py
   test_api.py
 Dockerfile
