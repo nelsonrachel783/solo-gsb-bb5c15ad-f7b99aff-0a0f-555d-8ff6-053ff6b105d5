@@ -622,5 +622,140 @@ class RedactPreviewApiTests(unittest.TestCase):
         self.assertIn("segments", resp.json())
 
 
+@unittest.skipUnless(_HAS_DEPS, "fastapi/httpx 未安装，跳过接口层测试")
+class TrailerPlanApiTests(unittest.TestCase):
+    WORDS = [
+        {"start_ms": 0, "end_ms": 500, "text": "甲", "speaker": "A"},
+        {"start_ms": 500, "end_ms": 1000, "text": "乙", "speaker": "A"},
+        {"start_ms": 1000, "end_ms": 1500, "text": "丙", "speaker": "B"},
+        {"start_ms": 1500, "end_ms": 2000, "text": "丁", "speaker": "B"},
+    ]
+    CANDIDATES = [
+        {"start_word": 0, "end_word": 1, "score": 3},
+        {"start_word": 2, "end_word": 3, "score": 5},
+    ]
+
+    def setUp(self):
+        self.client = TestClient(app)
+
+    def post(self, **overrides):
+        payload = {
+            "words": self.WORDS,
+            "candidates": self.CANDIDATES,
+            "budget_ms": 2000,
+            "required_speakers": ["A", "B"],
+        }
+        payload.update(overrides)
+        return self.client.post("/trailer-plan", json=payload)
+
+    def test_basic_trailer_plan(self):
+        resp = self.post()
+        self.assertEqual(resp.status_code, 200)
+        data = resp.json()
+        self.assertEqual(data["total_score"], 8)
+        self.assertEqual(data["total_duration_ms"], 2000)
+        self.assertEqual(
+            data["clips"],
+            [
+                {
+                    "index": 0,
+                    "candidate_index": 0,
+                    "speaker": "A",
+                    "score": 3,
+                    "start_word": 0,
+                    "end_word": 1,
+                    "source_start_ms": 0,
+                    "source_end_ms": 1000,
+                    "duration_ms": 1000,
+                    "trailer_start_ms": 0,
+                    "trailer_end_ms": 1000,
+                },
+                {
+                    "index": 1,
+                    "candidate_index": 1,
+                    "speaker": "B",
+                    "score": 5,
+                    "start_word": 2,
+                    "end_word": 3,
+                    "source_start_ms": 1000,
+                    "source_end_ms": 2000,
+                    "duration_ms": 1000,
+                    "trailer_start_ms": 1000,
+                    "trailer_end_ms": 2000,
+                },
+            ],
+        )
+
+    def test_trailer_times_accumulate_from_zero(self):
+        candidates = [
+            {"start_word": 2, "end_word": 2, "score": 1},
+            {"start_word": 0, "end_word": 0, "score": 1},
+        ]
+        resp = self.post(candidates=candidates, required_speakers=["A", "B"])
+        self.assertEqual(resp.status_code, 200)
+        data = resp.json()
+        # 按原时间顺序输出（候选 1 的词 0 在前），预告片时刻从 0 累加
+        self.assertEqual([c["candidate_index"] for c in data["clips"]], [1, 0])
+        self.assertEqual(
+            [(c["trailer_start_ms"], c["trailer_end_ms"]) for c in data["clips"]],
+            [(0, 500), (500, 1000)],
+        )
+
+    def test_infeasible_returns_422(self):
+        # 两段共 2000ms，预算 1500 放不下，而 A、B 都必选
+        resp = self.post(budget_ms=1500)
+        self.assertEqual(resp.status_code, 422)
+        err = resp.json()["error"]
+        self.assertEqual(err["code"], "infeasible_trailer_plan")
+        self.assertEqual(err["candidate_count"], 2)
+        self.assertEqual(err["budget_ms"], 1500)
+        self.assertEqual(err["required_speakers"], ["A", "B"])
+
+    def test_candidate_index_out_of_range(self):
+        resp = self.post(candidates=[{"start_word": 0, "end_word": 4, "score": 1}])
+        self.assertEqual(resp.status_code, 422)
+        err = resp.json()["error"]
+        self.assertEqual(err["code"], "candidate_index_out_of_range")
+        self.assertEqual(err["candidate_index"], 0)
+
+    def test_multi_speaker_candidate_rejected(self):
+        resp = self.post(candidates=[{"start_word": 1, "end_word": 2, "score": 1}])
+        self.assertEqual(resp.status_code, 422)
+        self.assertEqual(resp.json()["error"]["code"], "candidate_not_single_speaker")
+
+    def test_candidate_count_out_of_range(self):
+        for bad in ([], [{"start_word": 0, "end_word": 0, "score": 0}] * 21):
+            resp = self.post(candidates=bad)
+            self.assertEqual(resp.status_code, 422)
+            self.assertEqual(resp.json()["error"]["code"], "invalid_request")
+
+    def test_negative_fields_rejected(self):
+        for overrides in (
+            {"candidates": [{"start_word": 0, "end_word": 1, "score": -1}]},
+            {"candidates": [{"start_word": -1, "end_word": 1, "score": 0}]},
+            {"budget_ms": -1},
+        ):
+            resp = self.post(**overrides)
+            self.assertEqual(resp.status_code, 422)
+            self.assertEqual(resp.json()["error"]["code"], "invalid_request")
+
+    def test_required_speakers_out_of_range(self):
+        for bad in ([], ["A", "B", "C", "D"], [""]):
+            resp = self.post(required_speakers=bad)
+            self.assertEqual(resp.status_code, 422)
+            self.assertEqual(resp.json()["error"]["code"], "invalid_request")
+
+    def test_word_validation_reused(self):
+        words = [dict(self.WORDS[1]), dict(self.WORDS[0])]  # 时间倒序
+        resp = self.post(words=words)
+        self.assertEqual(resp.status_code, 422)
+        self.assertEqual(resp.json()["error"]["code"], "time_out_of_order")
+
+    def test_segments_still_works(self):
+        resp = self.client.post("/segments", json={"words": self.WORDS})
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn("segments", resp.json())
+
+
 if __name__ == "__main__":
     unittest.main()
